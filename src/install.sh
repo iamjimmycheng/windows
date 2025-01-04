@@ -119,10 +119,12 @@ finishInstall() {
   fi
 
   rm -f "$STORAGE/windows.old"
-  rm -f "$STORAGE/windows.type"
+  rm -f "$STORAGE/windows.vga"
+  rm -f "$STORAGE/windows.args"
   rm -f "$STORAGE/windows.base"
   rm -f "$STORAGE/windows.boot"
   rm -f "$STORAGE/windows.mode"
+  rm -f "$STORAGE/windows.type"
 
   cp -f /run/version "$STORAGE/windows.ver"
 
@@ -155,6 +157,11 @@ finishInstall() {
     fi
   fi
 
+  if [ -n "${ARGS:-}" ]; then
+    ARGUMENTS="$ARGS ${ARGUMENTS:-}"
+    echo "$ARGS" > "$STORAGE/windows.args"
+  fi
+
   if [ -n "${DISK_TYPE:-}" ] && [[ "${DISK_TYPE:-}" != "scsi" ]]; then
     echo "$DISK_TYPE" > "$STORAGE/windows.type"
   fi
@@ -167,10 +174,13 @@ abortInstall() {
 
   local dir="$1"
   local iso="$2"
+  local efi
 
   [[ "${iso,,}" == *".esd" ]] && exit 60
 
-  if [ ! -d "$dir/EFI" ]; then
+  efi=$(find "$dir" -maxdepth 1 -type d -iname efi | head -n 1)
+
+  if [ -z "$efi" ]; then
     [[ "${PLATFORM,,}" == "x64" ]] && BOOT_MODE="windows_legacy"
   fi
 
@@ -537,7 +547,7 @@ detectImage() {
   fi
 
   info=$(wimlib-imagex info -xml "$wim" | tr -d '\000')
-  ! checkPlatform "$info" && exit 67
+  checkPlatform "$info" || exit 67
 
   DETECTED=$(detectVersion "$info")
 
@@ -557,7 +567,7 @@ detectImage() {
 
   if [[ "${LANGUAGE,,}" != "en" ]] && [[ "${LANGUAGE,,}" != "en-"* ]]; then
     language=$(getLanguage "$LANGUAGE" "desc")
-    desc="$desc ($language)"
+    desc+=" ($language)"
   fi
 
   info "Detected: $desc"
@@ -584,7 +594,7 @@ prepareImage() {
 
   desc=$(printVersion "$DETECTED" "$DETECTED")
 
-  ! setMachine "$DETECTED" "$iso" "$dir" "$desc" && return 1
+  setMachine "$DETECTED" "$iso" "$dir" "$desc" || return 1
   skipVersion "$DETECTED" && return 0
 
   if [[ "${BOOT_MODE,,}" != "windows_legacy" ]]; then
@@ -609,6 +619,12 @@ updateXML() {
   local asset="$1"
   local language="$2"
   local culture region user admin pass keyboard
+
+  [ -z "$HEIGHT" ] && HEIGHT="720"
+  [ -z "$WIDTH" ] && WIDTH="1280"
+
+  sed -i "s/<VerticalResolution>1080<\/VerticalResolution>/<VerticalResolution>$HEIGHT<\/VerticalResolution>/g" "$asset"
+  sed -i "s/<HorizontalResolution>1920<\/HorizontalResolution>/<HorizontalResolution>$WIDTH<\/HorizontalResolution>/g" "$asset"
 
   culture=$(getLanguage "$language" "culture")
 
@@ -669,7 +685,7 @@ addDriver() {
     "win81x64"* ) folder="w8.1/amd64" ;;
     "win10x64"* ) folder="w10/amd64" ;;
     "win11x64"* ) folder="w11/amd64" ;;
-    "win2025"* ) folder="2k22/amd64" ;;
+    "win2025"* ) folder="2k25/amd64" ;;
     "win2022"* ) folder="2k22/amd64" ;;
     "win2019"* ) folder="2k19/amd64" ;;
     "win2016"* ) folder="2k16/amd64" ;;
@@ -687,53 +703,70 @@ addDriver() {
 
   [ ! -d "$path/$driver/$folder" ] && return 0
 
-  if [[ "${id,,}" == "winvista"* ]]; then
-    [[ "${driver,,}" == "viorng" ]] && return 0
-  fi
+  case "${id,,}" in
+    "winvista"* )
+      [[ "${driver,,}" == "viorng" ]] && return 0
+      ;;
+  esac
 
   local dest="$path/$target/$driver"
-  mv "$path/$driver/$folder" "$dest"
+  mkdir -p "$dest" || return 1
+  cp -Lr "$path/$driver/$folder/." "$dest" || return 1
 
   return 0
 }
 
 addDrivers() {
 
-  local file="$1"
-  local index="$2"
-  local version="$3"
+  local src="$1"
+  local tmp="$2"
+  local file="$3"
+  local index="$4"
+  local version="$5"
+  local drivers="$tmp/drivers"
+
+  rm -rf "$drivers"
+  mkdir -p "$drivers"
 
   local msg="Adding drivers to image..."
   info "$msg" && html "$msg"
 
-  local drivers="$TMP/drivers"
-  mkdir -p "$drivers"
-
-  if ! tar -xf /drivers.txz -C "$drivers" --warning=no-timestamp; then
-    error "Failed to extract driver!" && return 1
+  if ! bsdtar -xf /drivers.txz -C "$drivers"; then
+    error "Failed to extract drivers from archive!" && return 1
   fi
 
   local target="\$WinPEDriver\$"
   local dest="$drivers/$target"
-  mkdir -p "$dest"
+  mkdir -p "$dest" || return 1
 
   wimlib-imagex update "$file" "$index" --command "delete --force --recursive /$target" >/dev/null || true
 
-  addDriver "$version" "$drivers" "$target" "qxl"
-  addDriver "$version" "$drivers" "$target" "viofs"
-  addDriver "$version" "$drivers" "$target" "sriov"
-  addDriver "$version" "$drivers" "$target" "smbus"
-  addDriver "$version" "$drivers" "$target" "qxldod"
-  addDriver "$version" "$drivers" "$target" "viorng"
-  addDriver "$version" "$drivers" "$target" "viostor"
-  addDriver "$version" "$drivers" "$target" "NetKVM"
-  addDriver "$version" "$drivers" "$target" "Balloon"
-  addDriver "$version" "$drivers" "$target" "vioscsi"
-  addDriver "$version" "$drivers" "$target" "pvpanic"
-  addDriver "$version" "$drivers" "$target" "vioinput"
-  addDriver "$version" "$drivers" "$target" "viogpudo"
-  addDriver "$version" "$drivers" "$target" "vioserial"
-  addDriver "$version" "$drivers" "$target" "qemupciserial"
+  addDriver "$version" "$drivers" "$target" "qxl" || return 1
+  addDriver "$version" "$drivers" "$target" "viofs" || return 1
+  addDriver "$version" "$drivers" "$target" "sriov" || return 1
+  addDriver "$version" "$drivers" "$target" "smbus" || return 1
+  addDriver "$version" "$drivers" "$target" "qxldod" || return 1
+  addDriver "$version" "$drivers" "$target" "viorng" || return 1
+  addDriver "$version" "$drivers" "$target" "viostor" || return 1
+  addDriver "$version" "$drivers" "$target" "viomem" || return 1
+  addDriver "$version" "$drivers" "$target" "NetKVM" || return 1
+  addDriver "$version" "$drivers" "$target" "Balloon" || return 1
+  addDriver "$version" "$drivers" "$target" "vioscsi" || return 1
+  addDriver "$version" "$drivers" "$target" "pvpanic" || return 1
+  addDriver "$version" "$drivers" "$target" "vioinput" || return 1
+  addDriver "$version" "$drivers" "$target" "viogpudo" || return 1
+  addDriver "$version" "$drivers" "$target" "vioserial" || return 1
+  addDriver "$version" "$drivers" "$target" "qemupciserial" || return 1
+
+  case "${version,,}" in
+    "win11x64"* | "win2025"* )
+      # Workaround Virtio GPU driver bug
+      local dst="$src/\$OEM\$/\$\$/Drivers"
+      mkdir -p "$dst" || return 1
+      cp -Lr "$dest/." "$dst" || return 1
+      rm -rf "$dest/viogpudo"
+      ;;
+  esac
 
   if ! wimlib-imagex update "$file" "$index" --command "add $dest /$target" >/dev/null; then
     return 1
@@ -743,36 +776,12 @@ addDrivers() {
   return 0
 }
 
-addFolder() {
-
-  local src="$1"
-  local folder="/oem"
-
-  [ ! -d "$folder" ] && folder="/OEM"
-  [ ! -d "$folder" ] && folder="$STORAGE/oem"
-  [ ! -d "$folder" ] && folder="$STORAGE/OEM"
-  [ ! -d "$folder" ] && return 0
-
-  local msg="Adding OEM folder to image..."
-  info "$msg" && html "$msg"
-
-  local dest="$src/\$OEM\$/\$1/"
-  mkdir -p "$dest"
-
-  ! cp -r "$folder" "$dest" && return 1
-
-  local file
-  file=$(find "$dest" -maxdepth 1 -type f -iname install.bat | head -n 1)
-  [ -f "$file" ] && unix2dos -q "$file"
-
-  return 0
-}
-
 updateImage() {
 
   local dir="$1"
   local asset="$2"
   local language="$3"
+  local tmp="/tmp/install"
   local file="autounattend.xml"
   local org="${file//.xml/.org}"
   local dat="${file//.xml/.dat}"
@@ -787,6 +796,9 @@ updateImage() {
       warn "no answer file provided, $FB."
     fi
   fi
+
+  rm -rf "$tmp"
+  mkdir -p "$tmp"
 
   src=$(find "$dir" -maxdepth 1 -type d -iname sources | head -n 1)
 
@@ -808,25 +820,22 @@ updateImage() {
     index="2"
   fi
 
-  if ! addDrivers "$wim" "$index" "$DETECTED"; then
-    error "Failed to add drivers to image!" && return 1
+  if ! addDrivers "$src" "$tmp" "$wim" "$index" "$DETECTED"; then
+    error "Failed to add drivers to image!"
   fi
 
   if ! addFolder "$src"; then
-    error "Failed to add OEM folder to image!" && return 1
+    error "Failed to add OEM folder to image!"
   fi
 
-  if wimlib-imagex extract "$wim" "$index" "/$file" "--dest-dir=$TMP" >/dev/null 2>&1; then
-    if ! wimlib-imagex extract "$wim" "$index" "/$dat" "--dest-dir=$TMP" >/dev/null 2>&1; then
-      if ! wimlib-imagex extract "$wim" "$index" "/$org" "--dest-dir=$TMP" >/dev/null 2>&1; then
+  if wimlib-imagex extract "$wim" "$index" "/$file" "--dest-dir=$tmp" >/dev/null 2>&1; then
+    if ! wimlib-imagex extract "$wim" "$index" "/$dat" "--dest-dir=$tmp" >/dev/null 2>&1; then
+      if ! wimlib-imagex extract "$wim" "$index" "/$org" "--dest-dir=$tmp" >/dev/null 2>&1; then
         if ! wimlib-imagex update "$wim" "$index" --command "rename /$file /$org" > /dev/null; then
           warn "failed to backup original answer file ($file)."
         fi
       fi
     fi
-    rm -f "$TMP/$dat"
-    rm -f "$TMP/$org"
-    rm -f "$TMP/$file"
   fi
 
   if [[ "$MANUAL" != [Yy1]* ]]; then
@@ -834,7 +843,7 @@ updateImage() {
     xml=$(basename "$asset")
     info "Adding $xml for automatic installation..."
 
-    local answer="$TMP/$xml"
+    local answer="$tmp/$xml"
     cp "$asset" "$answer"
     updateXML "$answer" "$language"
 
@@ -845,21 +854,17 @@ updateImage() {
       wimlib-imagex update "$wim" "$index" --command "add $answer /$dat" > /dev/null || true
     fi
 
-    rm -f "$answer"
-
   fi
 
   if [[ "$MANUAL" == [Yy1]* ]]; then
 
     wimlib-imagex update "$wim" "$index" --command "delete --force /$file" > /dev/null || true
 
-    if wimlib-imagex extract "$wim" "$index" "/$org" "--dest-dir=$TMP" >/dev/null 2>&1; then
-      if ! wimlib-imagex update "$wim" "$index" --command "add $TMP/$org /$file" > /dev/null; then
+    if wimlib-imagex extract "$wim" "$index" "/$org" "--dest-dir=$tmp" >/dev/null 2>&1; then
+      if ! wimlib-imagex update "$wim" "$index" --command "add $tmp/$org /$file" > /dev/null; then
         warn "failed to restore original answer file ($org)."
       fi
     fi
-
-    rm -f "$TMP/$org"
 
   fi
 
@@ -875,6 +880,7 @@ updateImage() {
     fi
   fi
 
+  rm -rf "$tmp"
   return 0
 }
 
@@ -884,7 +890,8 @@ removeImage() {
 
   [ ! -f "$iso" ] && return 0
   [ -n "$CUSTOM" ] && return 0
-  ! rm -f "$iso" 2> /dev/null && warn "failed to remove $iso !"
+
+  rm -f "$iso" 2> /dev/null || warn "failed to remove $iso !"
 
   return 0
 }
@@ -927,20 +934,20 @@ buildImage() {
 
   if [[ "${BOOT_MODE,,}" != "windows_legacy" ]]; then
 
-    ! genisoimage -o "$out" -b "$ETFS" -no-emul-boot -c "$cat" -iso-level 4 -J -l -D -N -joliet-long -relaxed-filenames -V "${LABEL::30}" \
-                  -udf -boot-info-table -eltorito-alt-boot -eltorito-boot "$EFISYS" -no-emul-boot -allow-limited-size -quiet "$dir" 2> "$log" && failed="y"
+    genisoimage -o "$out" -b "$ETFS" -no-emul-boot -c "$cat" -iso-level 4 -J -l -D -N -joliet-long -relaxed-filenames -V "${LABEL::30}" \
+                  -udf -boot-info-table -eltorito-alt-boot -eltorito-boot "$EFISYS" -no-emul-boot -allow-limited-size -quiet "$dir" 2> "$log" || failed="y"
 
   else
 
     case "${DETECTED,,}" in
       "win2k"* | "winxp"* | "win2003"* )
-        ! genisoimage -o "$out" -b "$ETFS" -no-emul-boot -boot-load-seg 1984 -boot-load-size 4 -c "$cat" -iso-level 2 -J -l -D -N -joliet-long \
-                      -relaxed-filenames -V "${LABEL::30}" -quiet "$dir" 2> "$log" && failed="y" ;;
+        genisoimage -o "$out" -b "$ETFS" -no-emul-boot -boot-load-seg 1984 -boot-load-size 4 -c "$cat" -iso-level 2 -J -l -D -N -joliet-long \
+                      -relaxed-filenames -V "${LABEL::30}" -quiet "$dir" 2> "$log" || failed="y" ;;
       "win9"* )
-        ! genisoimage -o "$out" -b "$ETFS" -J -r -V "${LABEL::30}" -quiet "$dir" 2> "$log" && failed="y" ;;
+        genisoimage -o "$out" -b "$ETFS" -J -r -V "${LABEL::30}" -quiet "$dir" 2> "$log" || failed="y" ;;
       * )
-        ! genisoimage -o "$out" -b "$ETFS" -no-emul-boot -c "$cat" -iso-level 2 -J -l -D -N -joliet-long -relaxed-filenames -V "${LABEL::30}" \
-                      -udf -allow-limited-size -quiet "$dir" 2> "$log" && failed="y" ;;
+        genisoimage -o "$out" -b "$ETFS" -no-emul-boot -c "$cat" -iso-level 2 -J -l -D -N -joliet-long -relaxed-filenames -V "${LABEL::30}" \
+                      -udf -allow-limited-size -quiet "$dir" 2> "$log" || failed="y" ;;
     esac
 
   fi
@@ -956,7 +963,7 @@ buildImage() {
   [ -s "$log" ] && error="$(<"$log")"
   [[ "$error" != "$hide" ]] && echo "$error"
 
-  ! mv -f "$out" "$BOOT" && return 1
+  mv -f "$out" "$BOOT" || return 1
   return 0
 }
 
@@ -964,10 +971,13 @@ bootWindows() {
 
   rm -rf "$TMP"
 
-  [[ "${PLATFORM,,}" == "arm64" ]] && VGA="virtio-gpu"
+  if [ -f "$STORAGE/windows.args" ]; then
+    ARGS=$(<"$STORAGE/windows.args")
+    ARGUMENTS="$ARGS ${ARGUMENTS:-}"
+  fi
 
   if [ -s "$STORAGE/windows.type" ] && [ -f "$STORAGE/windows.type" ]; then
-    DISK_TYPE=$(<"$STORAGE/windows.type")
+    [ -z "${DISK_TYPE:-}" ] && DISK_TYPE=$(<"$STORAGE/windows.type")
   fi
 
   if [ -s "$STORAGE/windows.mode" ] && [ -f "$STORAGE/windows.mode" ]; then
